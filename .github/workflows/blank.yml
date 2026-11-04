@@ -18,9 +18,19 @@ jobs:
         distribution: 'temurin'
         java-version: '17'
 
-    - name: Scan Project Files
-      run: |
-        echo "Memeriksa isi folder proyek..."
-        ls -la
-        find . -name "*.json" -o -name "*.gradle" -o -name "build.gradle"
+    - name: Setup Android SDK
+      uses: android-actions/setup-android@v3
 
+    - name: Build APK with Gradle
+      run: |
+        chmod +x gradlew || echo "Gradlew tidak ada"
+        ./gradlew assembleDebug || ./gradlew build
+
+    - name: Upload APK Artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: app-debug
+        path: |
+          app/build/outputs/apk/debug/app-debug.apk
+          build/outputs/apk/debug/*.apk
+          *.apk
