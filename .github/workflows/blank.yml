@@ -18,7 +18,9 @@ jobs:
         distribution: 'temurin'
         java-version: '17'
 
-    - name: Build with Gradle and Check Files
+    - name: Scan Project Files
       run: |
-        chmod +x gradlew || echo "Gradlew tidak ditemukan"
+        echo "Memeriksa isi folder proyek..."
         ls -la
+        find . -name "*.json" -o -name "*.gradle" -o -name "build.gradle"
+
