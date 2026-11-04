@@ -1,0 +1,320 @@
+{
+  "projectName": "VoxaLocal-Android-Jetpack-Compose-Offline-Speech",
+  "exportedAt": "2026-11-03T13:55:54.229Z",
+  "offlineArchitecture": {
+    "networkPermissions": "NONE",
+    "audioCapture": "android.media.AudioRecord (16000Hz PCM_16BIT Mono)",
+    "acousticEngine": "Vosk Kaldi FST / Whisper-Lite Quantized ONNX",
+    "storageRoot": "Context.filesDir/offline_recordings"
+  },
+  "kotlinProjectFiles": [
+    {
+      "path": "android/app/src/main/AndroidManifest.xml",
+      "filename": "AndroidManifest.xml",
+      "layer": "Manifest & Gradle",
+      "description": "Declares RECORD_AUDIO and scoped local storage permissions with zero internet permissions for strict air-gapped operation.",
+      "code": "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\"\n    package=\"com.voxalocal.offlinespeech\">\n\n    <!-- 100% Offline Operation: Explicitly NO android.permission.INTERNET -->\n    <uses-permission android:name=\"android.permission.RECORD_AUDIO\" />\n    <!-- Scoped storage support for Android 9 and below; Android 10+ uses app-specific filesDir -->\n    <uses-permission\n        android:name=\"android.permission.WRITE_EXTERNAL_STORAGE\"\n        android:maxSdkVersion=\"28\" />\n    <uses-permission\n        android:name=\"android.permission.READ_EXTERNAL_STORAGE\"\n        android:maxSdkVersion=\"32\" />\n\n    <application\n        android:allowBackup=\"true\"\n        android:label=\"VoxaLocal Offline Speech\"\n        android:supportsRtl=\"true\"\n        android:theme=\"@android:style/Theme.Material.Light.NoActionBar\">\n        <activity\n            android:name=\".MainActivity\"\n            android:exported=\"true\"\n            android:configChanges=\"orientation|screenSize|screenLayout|keyboardHidden\">\n            <intent-filter>\n                <action android:name=\"android.intent.action.MAIN\" />\n                <category android:name=\"android.intent.category.LAUNCHER\" />\n            </intent-filter>\n        </activity>\n    </application>\n</manifest>"
+    },
+    {
+      "path": "android/app/src/main/java/com/voxalocal/offlinespeech/engine/OfflineSpeechEngine.kt",
+      "filename": "OfflineSpeechEngine.kt",
+      "layer": "Offline Speech Engine",
+      "description": "Local Vosk Kaldi / Whisper-lite acoustic frame processor with custom regional phonetic substitution rules and lexicon graph boosting.",
+      "code": "package com.voxalocal.offlinespeech.engine\n\nimport kotlinx.coroutines.flow.MutableStateFlow\nimport kotlinx.coroutines.flow.StateFlow\nimport kotlinx.coroutines.flow.asStateFlow\nimport kotlin.math.log10\nimport kotlin.math.sqrt\n\ndata class CustomVocabularyEntry(\n    val id: String,\n    val dialectWord: String,\n    val phoneticPattern: String,\n    val ipaNotation: String,\n    val dialectRegion: String,\n    val standardGloss: String,\n    val acousticAliases: List<String>,\n    val boostWeight: Float = 2.0f\n)\n\ndata class PhoneticRule(\n    val id: String,\n    val ruleName: String,\n    val sourcePhoneme: String,\n    val targetOrthography: String,\n    val dialectRegion: String,\n    val enabled: Boolean = true\n)\n\nclass OfflineSpeechEngine(\n    private val sampleRateHz: Int = 16000\n) {\n    private val _partialHypothesis = MutableStateFlow(\"\")\n    val partialHypothesis: StateFlow<String> = _partialHypothesis.asStateFlow()\n\n    private val _committedTranscript = MutableStateFlow(\"\")\n    val committedTranscript: StateFlow<String> = _committedTranscript.asStateFlow()\n\n    private var vocabularyEntries: List<CustomVocabularyEntry> = emptyList()\n    private var phoneticRules: List<PhoneticRule> = emptyList()\n\n    fun configureLanguageModel(\n        vocabulary: List<CustomVocabularyEntry>,\n        rules: List<PhoneticRule>\n    ) {\n        this.vocabularyEntries = vocabulary.sortedByDescending { it.boostWeight }\n        this.phoneticRules = rules.filter { it.enabled }\n    }\n\n    fun applyCustomPhoneticPipeline(rawPhoneticTokens: String): String {\n        if (rawPhoneticTokens.isBlank()) return \"\"\n        var transformed = rawPhoneticTokens.trim()\n\n        for (rule in phoneticRules) {\n            if (rule.sourcePhoneme.isNotEmpty()) {\n                transformed = transformed.replace(\n                    Regex(Regex.escape(rule.sourcePhoneme), RegexOption.IGNORE_CASE),\n                    rule.targetOrthography\n                )\n            }\n        }\n\n        val tokens = transformed.split(Regex(\"\\\\s+\"))\n        return tokens.joinToString(\" \") { rawToken ->\n            val clean = rawToken.lowercase().trim(',', '.', '?', '!')\n            val matched = vocabularyEntries.firstOrNull { entry ->\n                entry.dialectWord.equals(clean, ignoreCase = true) ||\n                entry.phoneticPattern.equals(clean, ignoreCase = true) ||\n                entry.acousticAliases.any { alias -> alias.equals(clean, ignoreCase = true) }\n            }\n            matched?.dialectWord ?: rawToken\n        }\n    }\n}"
+    },
+    {
+      "path": "android/app/src/main/java/com/voxalocal/offlinespeech/audio/AudioRecorderManager.kt",
+      "filename": "AudioRecorderManager.kt",
+      "layer": "AudioRecord & WAV I/O",
+      "description": "Captures 16kHz 16-bit PCM mono audio via Android AudioRecord, computes 24-band live amplitudes for Jetpack Compose Canvas, and writes RIFF WAV headers.",
+      "code": "package com.voxalocal.offlinespeech.audio\n\nimport android.annotation.SuppressLint\nimport android.media.AudioFormat\nimport android.media.AudioRecord\nimport android.media.MediaRecorder\nimport kotlinx.coroutines.CoroutineScope\nimport kotlinx.coroutines.Dispatchers\nimport kotlinx.coroutines.Job\nimport kotlinx.coroutines.flow.MutableStateFlow\nimport kotlinx.coroutines.flow.StateFlow\nimport kotlinx.coroutines.isActive\nimport kotlinx.coroutines.launch\nimport java.io.File\nimport java.io.FileOutputStream\nimport java.io.RandomAccessFile\nimport java.nio.ByteBuffer\nimport java.nio.ByteOrder\n\nclass AudioRecorderManager(private val sampleRate: Int = 16000) {\n    private var audioRecord: AudioRecord? = null\n    private var recordingJob: Job? = null\n\n    private val _isRecording = MutableStateFlow(false)\n    val isRecording: StateFlow<Boolean> = _isRecording\n\n    private val _waveformBands = MutableStateFlow(List(24) { 0.08f })\n    val waveformBands: StateFlow<List<Float>> = _waveformBands\n\n    @SuppressLint(\"MissingPermission\")\n    fun startRecording(\n        outputWavFile: File,\n        scope: CoroutineScope,\n        onAudioFrame: (ShortArray, Int) -> Float\n    ) {\n        val minBuf = AudioRecord.getMinBufferSize(\n            sampleRate,\n            AudioFormat.CHANNEL_IN_MONO,\n            AudioFormat.ENCODING_PCM_16BIT\n        ).coerceAtLeast(sampleRate / 5)\n\n        audioRecord = AudioRecord(\n            MediaRecorder.AudioSource.VOICE_RECOGNITION,\n            sampleRate,\n            AudioFormat.CHANNEL_IN_MONO,\n            AudioFormat.ENCODING_PCM_16BIT,\n            minBuf\n        )\n        audioRecord?.startRecording()\n        _isRecording.value = true\n\n        recordingJob = scope.launch(Dispatchers.IO) {\n            val pcmBuffer = ShortArray(1024)\n            var totalBytes = 0L\n            FileOutputStream(outputWavFile).use { fos ->\n                fos.write(ByteArray(44))\n                while (isActive && _isRecording.value) {\n                    val read = audioRecord?.read(pcmBuffer, 0, pcmBuffer.size) ?: 0\n                    if (read > 0) {\n                        onAudioFrame(pcmBuffer, read)\n                        val byteBuf = ByteBuffer.allocate(read * 2).order(ByteOrder.LITTLE_ENDIAN)\n                        for (i in 0 until read) byteBuf.putShort(pcmBuffer[i])\n                        fos.write(byteBuf.array())\n                        totalBytes += read * 2\n                    }\n                }\n            }\n            writeWavHeader(outputWavFile, totalBytes, sampleRate, 1, 16)\n        }\n    }\n}"
+    },
+    {
+      "path": "android/app/src/main/java/com/voxalocal/offlinespeech/data/LocalStorageRepository.kt",
+      "filename": "LocalStorageRepository.kt",
+      "layer": "Local Storage",
+      "description": "Persists WAV audio files and JSON metadata for Saved Transcriptions and Custom Language Dictionaries inside Context.filesDir.",
+      "code": "package com.voxalocal.offlinespeech.data\n\nimport android.content.Context\nimport org.json.JSONArray\nimport org.json.JSONObject\nimport java.io.File\n\nclass LocalStorageRepository(private val context: Context) {\n    private val recordingsDir: File\n        get() = File(context.filesDir, \"offline_recordings\").apply { mkdirs() }\n\n    private val transcriptionsFile: File\n        get() = File(context.filesDir, \"saved_transcriptions.json\")\n\n    fun createNewAudioFile(sessionId: String): File =\n        File(recordingsDir, \"voxalocal_${sessionId}.wav\")\n\n    fun deleteTranscriptionAndAudio(recordId: String) {\n        val wavFile = File(recordingsDir, \"voxalocal_${recordId}.wav\")\n        if (wavFile.exists()) wavFile.delete()\n    }\n}"
+    },
+    {
+      "path": "android/app/src/main/java/com/voxalocal/offlinespeech/MainActivity.kt",
+      "filename": "MainActivity.kt",
+      "layer": "Jetpack Compose UI",
+      "description": "Jetpack Compose Activity handling ActivityResultContracts.RequestMultiplePermissions, Live Waveform Canvas, Custom Dictionary Manager, and Saved Transcriptions Archive.",
+      "code": "package com.voxalocal.offlinespeech\n\nimport android.Manifest\nimport android.os.Bundle\nimport androidx.activity.ComponentActivity\nimport androidx.activity.compose.rememberLauncherForActivityResult\nimport androidx.activity.compose.setContent\nimport androidx.activity.result.contract.ActivityResultContracts\nimport androidx.compose.material3.*\nimport androidx.compose.runtime.*\n\nclass MainActivity : ComponentActivity() {\n    override fun onCreate(savedInstanceState: Bundle?) {\n        super.onCreate(savedInstanceState)\n        setContent {\n            MaterialTheme {\n                VoxaLocalMainApp()\n            }\n        }\n    }\n}"
+    }
+  ],
+  "customDialectDictionary": {
+    "vocabulary": [
+      {
+        "id": "voc-01",
+        "dialectId": "banyumasan",
+        "dialectWord": "inyong",
+        "phoneticPattern": "i-nyong",
+        "ipaNotation": "/iɲoŋ/",
+        "standardGloss": "First-person singular pronoun (I / me)",
+        "acousticAliases": [
+          "inyong",
+          "nyong",
+          "enyong",
+          "in-yong"
+        ],
+        "boostWeight": 3.5,
+        "category": "Lexicon"
+      },
+      {
+        "id": "voc-02",
+        "dialectId": "banyumasan",
+        "dialectWord": "kepriwe",
+        "phoneticPattern": "ke-pri-we",
+        "ipaNotation": "/kəpriwe/",
+        "standardGloss": "Interrogative manner (how / in what way)",
+        "acousticAliases": [
+          "kepriwe",
+          "kepriben",
+          "priwe",
+          "ke-priwe"
+        ],
+        "boostWeight": 3.2,
+        "category": "Discourse"
+      },
+      {
+        "id": "voc-03",
+        "dialectId": "banyumasan",
+        "dialectWord": "rika",
+        "phoneticPattern": "ri-ka",
+        "ipaNotation": "/rikɑ/",
+        "standardGloss": "Respectful second-person pronoun (you)",
+        "acousticAliases": [
+          "rika",
+          "riko",
+          "ri-ka"
+        ],
+        "boostWeight": 2.8,
+        "category": "Kinship"
+      },
+      {
+        "id": "voc-04",
+        "dialectId": "banyumasan",
+        "dialectWord": "mandan",
+        "phoneticPattern": "man-dan",
+        "ipaNotation": "/mandan/",
+        "standardGloss": "Degree modifier (somewhat / rather / quite)",
+        "acousticAliases": [
+          "mandan",
+          "rada",
+          "man-dan"
+        ],
+        "boostWeight": 2.5,
+        "category": "Lexicon"
+      },
+      {
+        "id": "voc-05",
+        "dialectId": "banyumasan",
+        "dialectWord": "klalen",
+        "phoneticPattern": "kla-len",
+        "ipaNotation": "/klalɛn/",
+        "standardGloss": "To forget unintentionally",
+        "acousticAliases": [
+          "klalen",
+          "kelalen",
+          "lali"
+        ],
+        "boostWeight": 2.7,
+        "category": "Lexicon"
+      },
+      {
+        "id": "voc-06",
+        "dialectId": "banyumasan",
+        "dialectWord": "madhang",
+        "phoneticPattern": "ma-dhang",
+        "ipaNotation": "/maɖaŋ/",
+        "standardGloss": "To eat a meal (retroflex voiced stop)",
+        "acousticAliases": [
+          "madhang",
+          "madang",
+          "ma-dang"
+        ],
+        "boostWeight": 3,
+        "category": "Agrarian"
+      },
+      {
+        "id": "voc-07",
+        "dialectId": "minang_darek",
+        "dialectWord": "ambo",
+        "phoneticPattern": "am-bo",
+        "ipaNotation": "/ambɔ/",
+        "standardGloss": "Polite first-person pronoun (I)",
+        "acousticAliases": [
+          "ambo",
+          "awak",
+          "denai"
+        ],
+        "boostWeight": 3.4,
+        "category": "Kinship"
+      },
+      {
+        "id": "voc-08",
+        "dialectId": "minang_darek",
+        "dialectWord": "ninik mamak",
+        "phoneticPattern": "ni-nik-ma-mak",
+        "ipaNotation": "/niniʔ mamaʔ/",
+        "standardGloss": "Matrilineal clan elders and customary leaders",
+        "acousticAliases": [
+          "ninik",
+          "mamak",
+          "ninikmamak"
+        ],
+        "boostWeight": 3.6,
+        "category": "Kinship"
+      },
+      {
+        "id": "voc-09",
+        "dialectId": "minang_darek",
+        "dialectWord": "harago abeh",
+        "phoneticPattern": "ha-ra-go a-beh",
+        "ipaNotation": "/haragɔ abɛh/",
+        "standardGloss": "Price of milled highland rice",
+        "acousticAliases": [
+          "haragoabeh",
+          "bareh",
+          "harago"
+        ],
+        "boostWeight": 2.9,
+        "category": "Agrarian"
+      },
+      {
+        "id": "voc-10",
+        "dialectId": "kadazan_dusun",
+        "dialectWord": "kopivosian",
+        "phoneticPattern": "ko-pi-vo-si-an",
+        "ipaNotation": "/kopiβosian/",
+        "standardGloss": "Traditional blessing and greeting of peace",
+        "acousticAliases": [
+          "kopivosian",
+          "kopiwosian",
+          "kopi-vosian"
+        ],
+        "boostWeight": 3.8,
+        "category": "Discourse"
+      },
+      {
+        "id": "voc-11",
+        "dialectId": "kadazan_dusun",
+        "dialectWord": "dikoyu insanganu",
+        "phoneticPattern": "di-ko-yu in-sa-nga-nu",
+        "ipaNotation": "/dikoju insaŋanu/",
+        "standardGloss": "To everyone gathered in the community",
+        "acousticAliases": [
+          "dikoyuinsanganu",
+          "dikoyu",
+          "insanganu"
+        ],
+        "boostWeight": 3.1,
+        "category": "Kinship"
+      },
+      {
+        "id": "voc-12",
+        "dialectId": "kadazan_dusun",
+        "dialectWord": "osonong nopo",
+        "phoneticPattern": "o-so-nong no-po",
+        "ipaNotation": "/osonoŋ nopo/",
+        "standardGloss": "All is well and peaceful",
+        "acousticAliases": [
+          "osonongnopo",
+          "osonong"
+        ],
+        "boostWeight": 3,
+        "category": "Discourse"
+      },
+      {
+        "id": "voc-13",
+        "dialectId": "bugis_wajo",
+        "dialectWord": "silessureng",
+        "phoneticPattern": "si-les-su-reng",
+        "ipaNotation": "/siləssurəŋ/",
+        "standardGloss": "Close kin / community sibling",
+        "acousticAliases": [
+          "silessureng",
+          "silesureng",
+          "sempugi"
+        ],
+        "boostWeight": 3.5,
+        "category": "Kinship"
+      },
+      {
+        "id": "voc-14",
+        "dialectId": "bugis_wajo",
+        "dialectWord": "lipa sabbe",
+        "phoneticPattern": "li-pa sab-be",
+        "ipaNotation": "/lipaʔ sabbɛ/",
+        "standardGloss": "Handwoven Bugis silk sarong",
+        "acousticAliases": [
+          "lipasabbe",
+          "sabbe",
+          "lipa"
+        ],
+        "boostWeight": 3.3,
+        "category": "Agrarian"
+      }
+    ],
+    "phoneticRules": [
+      {
+        "id": "rule-01",
+        "dialectId": "banyumasan",
+        "ruleName": "Retained Final Velar Stop /k#/",
+        "sourcePhoneme": "k?",
+        "targetOrthography": "k",
+        "ipaShift": "/ʔ#/ → /k#/",
+        "exampleInput": "bapak?",
+        "exampleOutput": "bapak",
+        "enabled": true
+      },
+      {
+        "id": "rule-02",
+        "dialectId": "banyumasan",
+        "ruleName": "Retroflex Dental Nasal Normalization",
+        "sourcePhoneme": "madang",
+        "targetOrthography": "madhang",
+        "ipaShift": "/d/ → /ɖ/ (orthographic dh)",
+        "exampleInput": "ayo pada madang",
+        "exampleOutput": "ayo pada madhang",
+        "enabled": true
+      },
+      {
+        "id": "rule-03",
+        "dialectId": "minang_darek",
+        "ruleName": "Highland Diphthong Lowering /-ai/ to /-e/",
+        "sourcePhoneme": "balay",
+        "targetOrthography": "balai",
+        "ipaShift": "/aj/ → /e ~ ai/",
+        "exampleInput": "pai ka balay",
+        "exampleOutput": "pai ka balai",
+        "enabled": true
+      },
+      {
+        "id": "rule-04",
+        "dialectId": "kadazan_dusun",
+        "ruleName": "Bilabial Fricative /w/ to /v/ Mapping",
+        "sourcePhoneme": "kopiwosian",
+        "targetOrthography": "kopivosian",
+        "ipaShift": "/w/ → /β/ (orthographic v)",
+        "exampleInput": "kopiwosian",
+        "exampleOutput": "kopivosian",
+        "enabled": true
+      },
+      {
+        "id": "rule-05",
+        "dialectId": "bugis_wajo",
+        "ruleName": "Geminate Sibilant Expansion",
+        "sourcePhoneme": "silesureng",
+        "targetOrthography": "silessureng",
+        "ipaShift": "/s/ → /ss/",
+        "exampleInput": "kareba silesureng",
+        "exampleOutput": "kareba silessureng",
+        "enabled": true
+      }
+    ]
+  },
+  "savedTranscriptionsCount": 3
+}
